@@ -86,14 +86,14 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
     /// - Determination arrived, cancelled timer
     /// - Preparing/Prepared watch state, Skipping - data unchanged
     /// - Settings throttle timer started/running/fired
-    private let debugWatchState = true
+    private let debugWatchState = false
 
     /// Enable/disable watch status and communication logs:
     /// - Device status changes (connected, notConnected, etc.)
     /// - Registered watchface/datafield
     /// - Sending to / Successfully sent
     /// - Watchface/datafield config changed
-    private let debugGarminEnabled = true
+    private let debugGarminEnabled = false
 
     /// Helper method for conditional watch status/comms logging.
     /// Logs messages only if debugGarminEnabled is true.
@@ -112,11 +112,11 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
 
     // MARK: - Deduplication
 
-    /// Hash of last sent data to prevent duplicate broadcasts
-    private var lastSentDataHash: Int?
+    /// Encoded data of last sent broadcast to prevent duplicate sends
+    private var lastSentData: Data?
 
-    /// Hash of last prepared data to skip redundant preparation
-    private var lastPreparedDataHash: Int?
+    /// Encoded data of last prepared watch state to skip redundant preparation
+    private var lastPreparedData: Data?
     private var lastPreparedWatchState: [GarminWatchState]?
 
     // MARK: - Glucose/Determination Coordination
@@ -668,8 +668,8 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
             }
 
             // Deduplicate: Check if data is unchanged from last preparation
-            let currentHash = watchStates.hashValue
-            if currentHash == self.lastPreparedDataHash {
+            let currentData = try? JSONEncoder().encode(watchStates)
+            if let currentData, currentData == self.lastPreparedData {
                 if self.debugWatchState {
                     debug(.watchManager, "Garmin: Skipping - data unchanged")
                 }
@@ -688,7 +688,7 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
             }
 
             // Cache for deduplication
-            self.lastPreparedDataHash = currentHash
+            self.lastPreparedData = currentData
             self.lastPreparedWatchState = watchStates
 
             return watchStates
@@ -717,7 +717,7 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
 
         // Reset broadcast hash so newly registered apps receive data
         // Without this, hash deduplication could skip sending to new apps if data unchanged
-        lastSentDataHash = nil
+        lastSentData = nil
 
         // Note: Do NOT clear readyDevices here. The device ready state is based on BLE
         // characteristic discovery, which only happens on new connections. Re-registering
@@ -831,18 +831,14 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
 
     /// Broadcasts watch state data to all registered apps
     private func broadcastWatchStateData(_ data: Data) {
-        // Deduplicate: Use stable content-based hash (sorted JSON bytes)
-        let currentHash: Int
-        if let sortedData = try? JSONSerialization.data(
+        // Deduplicate: Compare sorted JSON bytes for stable content comparison
+        let sortedData = try? JSONSerialization.data(
             withJSONObject: JSONSerialization.jsonObject(with: data, options: []),
             options: [.sortedKeys]
-        ) {
-            currentHash = sortedData.base64EncodedString().hashValue
-        } else {
-            currentHash = data.count // Fallback
-        }
+        )
+        let dataToCompare = sortedData ?? data
 
-        if currentHash == lastSentDataHash {
+        if dataToCompare == lastSentData {
             if debugWatchState {
                 debug(.watchManager, "Garmin: Skipping broadcast - data unchanged")
             }
@@ -855,7 +851,11 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
         }
 
         watchApps.forEach { app in
-            let appName = self.appDisplayName(for: app.uuid!)
+            guard let appUUID = app.uuid else {
+                debug(.watchManager, "Garmin: Skipping app with nil UUID")
+                return
+            }
+            let appName = self.appDisplayName(for: appUUID)
 
             // Check if device is ready (SDK 1.8+ requirement)
             guard let device = app.device, readyDevices.contains(device.uuid) else {
@@ -873,8 +873,8 @@ final class BaseGarminManager: NSObject, GarminManager, Injectable {
             }
         }
 
-        // Update last sent hash after initiating send
-        lastSentDataHash = currentHash
+        // Update last sent data after initiating send
+        lastSentData = dataToCompare
     }
 
     // MARK: - GarminManager Conformance
@@ -1012,7 +1012,11 @@ extension BaseGarminManager: IQUIOverrideDelegate, IQDeviceEventDelegate, IQAppM
     ///   - message: The message content from the watch app.
     ///   - app: The watch app sending the message.
     func receivedMessage(_ message: Any, from app: IQApp) {
-        let appName = appDisplayName(for: app.uuid!)
+        guard let appUUID = app.uuid else {
+            debug(.watchManager, "Garmin: Received message from app with nil UUID")
+            return
+        }
+        let appName = appDisplayName(for: appUUID)
         debugGarmin("Garmin: Received message '\(message)' from \(appName)")
 
         // If watch requests status update, send current data via unified path
